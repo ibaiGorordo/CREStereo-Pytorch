@@ -1,6 +1,4 @@
 import torch
-from torchsummary import summary
-import numpy as np
 
 from nets import Model
 
