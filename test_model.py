@@ -54,9 +54,11 @@ if __name__ == '__main__':
 	disp_vis = (disp - disp.min()) / (disp.max() - disp.min()) * 255.0
 	disp_vis = disp_vis.astype("uint8")
 	disp_vis = cv2.applyColorMap(disp_vis, cv2.COLORMAP_INFERNO)
+	disp_vis = cv2.resize(disp_vis, left_img.shape[1::-1])
 
-	cv2.imshow("output", disp_vis)
-	cv2.imwrite("output.jpg", disp_vis)
+	combined_img = np.hstack((left_img, disp_vis))
+	cv2.imshow("output", combined_img)
+	cv2.imwrite("output.jpg", combined_img)
 	cv2.waitKey(0)
 
 
