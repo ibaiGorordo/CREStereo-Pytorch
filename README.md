@@ -2,7 +2,6 @@
  Non-official Pytorch implementation of the CREStereo (CVPR 2022 Oral) model converted from the original MegEngine implementation.
 
 ![!CREStereo-Pytorch stereo detph estimation](https://github.com/ibaiGorordo/CREStereo-Pytorch/blob/main/doc/img/output.jpg)
-*Stereo depth estimation on the cones images from the Middlebury dataset (https://vision.middlebury.edu/stereo/data/scenes2003/)*
  
 # Important
 - This is just an effort to try to implement the CREStereo model into Pytorch from MegEngine due to the issues of the framework to convert to other formats (https://github.com/megvii-research/CREStereo/issues/3).
@@ -22,4 +21,5 @@
 - CREStereo: https://github.com/megvii-research/CREStereo
 - RAFT: https://github.com/princeton-vl/RAFT
 - LoFTR: https://github.com/zju3dv/LoFTR
+- Grid sample replacement: https://zenn.dev/pinto0309/scraps/7d4032067d0160
 - torch2mge: https://github.com/MegEngine/torch2mge
