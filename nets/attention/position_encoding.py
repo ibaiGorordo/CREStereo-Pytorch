@@ -8,7 +8,7 @@ class PositionEncodingSine(nn.Module):
     This is a sinusoidal position encoding that generalized to 2-dimensional images
     """
 
-    def __init__(self, d_model, max_shape=(256, 256), temp_bug_fix=True):
+    def __init__(self, d_model, max_shape=(256, 256), temp_bug_fix=False):
         """
         Args:
             max_shape (tuple): for 1/8 featmap, the max length of 256 corresponds to 2048 pixels

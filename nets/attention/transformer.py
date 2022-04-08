@@ -24,7 +24,7 @@ class LoFTREncoderLayer(nn.Module):
         # feed-forward network
         self.mlp = nn.Sequential(
             nn.Linear(d_model*2, d_model*2, bias=False),
-            nn.ReLU(True),
+            nn.ReLU(),
             nn.Linear(d_model*2, d_model, bias=False),
         )
 
@@ -84,10 +84,10 @@ class LocalFeatureTransformer(nn.Module):
             mask0 (torch.Tensor): [N, L] (optional)
             mask1 (torch.Tensor): [N, S] (optional)
         """
-
         assert self.d_model == feat0.size(2), "the feature number of src and transformer must be equal"
 
         for layer, name in zip(self.layers, self.layer_names):
+
             if name == 'self':
                 feat0 = layer(feat0, feat0, mask0, mask0)
                 feat1 = layer(feat1, feat1, mask1, mask1)

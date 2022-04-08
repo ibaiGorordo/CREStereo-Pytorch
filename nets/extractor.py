@@ -24,9 +24,9 @@ class ResidualBlock(nn.Module):
             self.norm3 = nn.BatchNorm2d(planes)
         
         elif norm_fn == 'instance':
-            self.norm1 = nn.InstanceNorm2d(planes)
-            self.norm2 = nn.InstanceNorm2d(planes)
-            self.norm3 = nn.InstanceNorm2d(planes)
+            self.norm1 = nn.InstanceNorm2d(planes, affine=False)
+            self.norm2 = nn.InstanceNorm2d(planes, affine=False)
+            self.norm3 = nn.InstanceNorm2d(planes, affine=False)
 
         elif norm_fn == 'none':
             self.norm1 = nn.Sequential()
@@ -59,7 +59,7 @@ class BasicEncoder(nn.Module):
             self.norm1 = nn.BatchNorm2d(64)
 
         elif self.norm_fn == 'instance':
-            self.norm1 = nn.InstanceNorm2d(64)
+            self.norm1 = nn.InstanceNorm2d(64, affine=False)
 
         elif self.norm_fn == 'none':
             self.norm1 = nn.Sequential()

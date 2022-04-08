@@ -86,6 +86,8 @@ class AGCL:
             left_feature = left_feature.permute(0, 2, 3, 1).reshape(N, H * W, C)  # 'n c h w -> n (h w) c'
             right_feature = right_feature.permute(0, 2, 3, 1).reshape(N, H * W, C)  # 'n c h w -> n (h w) c'
             # 'n (h w) c -> n c h w'
+            left_feature, right_feature = self.att(left_feature, right_feature)
+            # 'n (h w) c -> n c h w'
             left_feature, right_feature = [
                 x.reshape(N, H, W, C).permute(0, 3, 1, 2)
                 for x in [left_feature, right_feature]
