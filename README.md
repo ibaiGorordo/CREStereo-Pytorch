@@ -19,6 +19,7 @@
 
 # References:
 - CREStereo: https://github.com/megvii-research/CREStereo
+- CREStereo-Pytorch: https://github.com/ibaiGorordo/CREStereo-Pytorch
 - RAFT: https://github.com/princeton-vl/RAFT
 - LoFTR: https://github.com/zju3dv/LoFTR
 - Grid sample replacement: https://zenn.dev/pinto0309/scraps/7d4032067d0160
