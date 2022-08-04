@@ -50,6 +50,9 @@ if __name__ == '__main__':
 
 	# Resize image in case the GPU memory overflows
 	eval_h, eval_w = (in_h,in_w)
+	assert eval_h%8 == 0, "input height should be divisible by 8"
+	assert eval_w%8 == 0, "input width should be divisible by 8"
+	
 	imgL = cv2.resize(left_img, (eval_w, eval_h), interpolation=cv2.INTER_LINEAR)
 	imgR = cv2.resize(right_img, (eval_w, eval_h), interpolation=cv2.INTER_LINEAR)
 
