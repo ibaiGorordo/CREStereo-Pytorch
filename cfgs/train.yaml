@@ -17,4 +17,4 @@ image_height: 384
 training_data_path: "./stereo_trainset/crestereo"
 
 log_level: "logging.INFO"
-
+dist: True # True for DDP, False for DP

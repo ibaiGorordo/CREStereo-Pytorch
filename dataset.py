@@ -4,7 +4,7 @@ import glob
 import numpy as np
 from PIL import Image, ImageEnhance
 
-from megengine.data.dataset import Dataset
+from torch.utils.data import Dataset
 
 
 class Augmentor:
