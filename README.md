@@ -2,6 +2,18 @@
  Non-official Pytorch implementation of the CREStereo (CVPR 2022 Oral) model converted from the original MegEngine implementation.
 
 ![!CREStereo-Pytorch stereo detph estimation](https://github.com/ibaiGorordo/CREStereo-Pytorch/blob/main/doc/img/output.jpg)
+
+**update 2023/01/03**:
+- enable DistributedDataParallel (DDP) training, training time is much faster than before.  
+
+```shell
+# train DDP
+# change 'dist' to True in /cfgs/train.yaml file
+python -m torch.distributed.launch --nproc_per_node=8 train.py
+# train DP
+# change 'dist' to False in /cfgs/train.yaml file
+python train.py
+```
  
 # Important
 - This is just an effort to try to implement the CREStereo model into Pytorch from MegEngine due to the issues of the framework to convert to other formats (https://github.com/megvii-research/CREStereo/issues/3).
