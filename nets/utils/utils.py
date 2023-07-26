@@ -3,6 +3,8 @@ import torch.nn.functional as F
 import numpy as np
 
 #Ref: https://github.com/princeton-vl/RAFT/blob/master/core/utils/utils.py
+dxs = list()
+dys = list()
 
 def bilinear_sampler(img, coords, mode='bilinear', mask=False):
     """ Wrapper for grid_sample, uses pixel coordinates """
@@ -62,6 +64,20 @@ def bilinear_grid_sample(im, grid, align_corners=False):
     else:
         x = ((x + 1) * w - 1) / 2
         y = ((y + 1) * h - 1) / 2
+
+    _x = x[0].floor().int().cpu().numpy()
+    _y = y[0].floor().int().cpu().numpy()
+    assert _x.shape == _y.shape
+    _gh,_w = _x.shape
+    assert _gh % h == 0
+    assert _w == w
+    _g = _gh // h
+    dx = _x - np.arange(w)
+    dy = _y.transpose(1,0) - np.array([range(h) for _ in range(_g)]).reshape(-1)
+#   print(f'max(dx)={dx.min()}, max(dx)={dx.max()}')
+#   print(f'max(dy)={dy.min()}, max(dy)={dy.max()}')
+    dxs.append(dx.max()-dx.min()+1)
+    dys.append(dy.max()-dy.min()+1)
 
     x = x.view(n, -1)
     y = y.view(n, -1)
