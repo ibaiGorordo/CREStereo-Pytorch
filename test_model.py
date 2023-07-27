@@ -65,11 +65,11 @@ if __name__ == '__main__':
     model.to(device)
     model.eval()
 
-    scale_factor,downsample = 1,True    # max(dx),max(dy)=21,4
-    scale_factor,downsample = 2,True    # max(dx),max(dy)=22,4
-    scale_factor,downsample = 4,True    # max(dx),max(dy)=27,4
-    scale_factor,downsample = 2,False   # max(dx),max(dy)=32,4
-    scale_factor,downsample = 4,False   # max(dx),max(dy)=46,5
+    scale_factor,downsample = 4,False   # max(dx),max(dy)=46,5; dx=(-39,33), dy=(-3,1)
+    scale_factor,downsample = 2,False   # max(dx),max(dy)=32,4; dx=(-28,18), dy=(-2,1)
+    scale_factor,downsample = 4,True    # max(dx),max(dy)=27,4; dx=(-22,5), dy=(-2,1)
+    scale_factor,downsample = 2,True    # max(dx),max(dy)=22,4; dx=(-16,6), dy=(-2,1)
+    scale_factor,downsample = 1,True    # max(dx),max(dy)=21,4; dx=(-14,8), dy=(-2,1)
 
     assert imgL.shape == imgR.shape
     H,W,_ = imgL.shape
@@ -85,8 +85,26 @@ if __name__ == '__main__':
     # }; end of resize
     size = (H_,W_) = resize(scale_factor, downsample)
     pred = inference(imgL, imgR, model, size, n_iter=20)
-#   print(dxs, dys)
-    print(max(dxs), max(dys))
+    print(dxs, dys)
+#   print(max(dxs), max(dys))
+    def set_mm(ds): # {
+        d_min_min = +100
+        d_max_max = -100
+        d = 0
+        for d_min,d_max in ds:
+            if d_min < d_min_min:
+                d_min_min = d_min
+            if d_max > d_max_max:
+                d_max_max = d_max
+            _ = d_max - d_min + 1
+            if _ > d:
+                d = _
+        return d_min_min,d_max_max,d
+    # }; end of set_mm
+    dx_min_min,dx_max_max,dx = set_mm(dxs)
+    dy_min_min,dy_max_max,dy = set_mm(dys)
+    print(dx_min_min,dx_max_max,dx)
+    print(dy_min_min,dy_max_max,dy)
 
     t = float(in_w) / float(eval_w)
     disp = cv2.resize(pred, (in_w, in_h), interpolation=cv2.INTER_LINEAR) * t

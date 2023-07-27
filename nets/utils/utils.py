@@ -76,8 +76,8 @@ def bilinear_grid_sample(im, grid, align_corners=False):
     dy = _y.transpose(1,0) - np.array([range(h) for _ in range(_g)]).reshape(-1)
 #   print(f'max(dx)={dx.min()}, max(dx)={dx.max()}')
 #   print(f'max(dy)={dy.min()}, max(dy)={dy.max()}')
-    dxs.append(dx.max()-dx.min()+1)
-    dys.append(dy.max()-dy.min()+1)
+    dxs.append((dx.min(), dx.max()))
+    dys.append((dy.min(), dy.max()))
 
     x = x.view(n, -1)
     y = y.view(n, -1)
