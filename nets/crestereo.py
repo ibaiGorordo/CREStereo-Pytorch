@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,7 +7,7 @@ from .update import BasicUpdateBlock
 from .extractor import BasicEncoder
 from .corr import AGCL
 
-from .attention import PositionEncodingSine, LocalFeatureTransformer
+from .attention import LocalFeatureTransformer
 
 try:
     autocast = torch.cuda.amp.autocast
@@ -19,6 +20,31 @@ except:
             pass
         def __exit__(self, *args):
             pass
+
+def sine_position_encoding(d_model, h, w, device):
+    """PositionEncodingSine(d_model, max_shape=(h, w)).pe (temp_bug_fix=False, the trained variant) without the table:
+    channel 4k+j = sin(x d_k), cos(x d_k), sin(y d_k), cos(y d_k); x, y 1-based; d_k = exp(2k * (-log(1e4) / d_model // 2))."""
+    div = torch.exp(
+        torch.arange(0, d_model // 2, 2, device=device).float()
+        * (-math.log(10000.0) / d_model // 2)
+    )
+    x = (
+        torch.arange(1, w + 1, device=device).float()[None, None, :] * div[:, None, None]
+    )  # [C/4, 1, w]
+    y = (
+        torch.arange(1, h + 1, device=device).float()[None, :, None] * div[:, None, None]
+    )  # [C/4, h, 1]
+    pe = torch.stack(
+        [
+            torch.sin(x).expand(-1, h, -1),
+            torch.cos(x).expand(-1, h, -1),
+            torch.sin(y).expand(-1, -1, w),
+            torch.cos(y).expand(-1, -1, w),
+        ],
+        1,
+    )  # [C/4, 4, h, w]
+    return pe.reshape(1, d_model, h, w)
+
 
 #Ref: https://github.com/princeton-vl/RAFT/blob/master/core/raft.py
 class CREStereo(nn.Module):
@@ -67,7 +93,10 @@ class CREStereo(nn.Module):
         mask = mask.view(N, 1, 9, rate, rate, H, W)
         mask = torch.softmax(mask, dim=2)
 
-        up_flow = F.unfold(rate * flow, [3,3], padding=1)
+        # 3x3 neighbourhoods as 9 shifted slices of the zero-padded flow (= F.unfold(.., [3,3], padding=1), same
+        # order; Im2Col has no ONNX / TensorRT counterpart)
+        fp = F.pad(rate * flow, [1, 1, 1, 1])
+        up_flow = torch.stack([fp[:, :, i:i + H, j:j + W] for i in range(3) for j in range(3)], dim=2)
         up_flow = up_flow.view(N, 2, 9, 1, 1, H, W)
 
         up_flow = torch.sum(mask * up_flow, dim=2)
@@ -92,7 +121,11 @@ class CREStereo(nn.Module):
 
         # run the feature network
         with autocast(enabled=self.mixed_precision):
-            fmap1, fmap2 = self.fnet([image1, image2])        
+            if self.training:
+                fmap1, fmap2 = self.fnet([image1, image2])
+            else:
+                # one image at a time: instance norm is per sample (same result), halves the full-res activation peak
+                fmap1, fmap2 = self.fnet(image1), self.fnet(image2)
         
         fmap1 = fmap1.float()
         fmap2 = fmap2.float()
@@ -127,19 +160,20 @@ class CREStereo(nn.Module):
             inp_dw16 = F.avg_pool2d(inp, 4, stride=4)
 
             # positional encoding and self-attention
-            pos_encoding_fn_small = PositionEncodingSine(
-                d_model=256, max_shape=(image1.shape[2] // 16, image1.shape[3] // 16)
-            )
+            # same values as PositionEncodingSine(256, max_shape=(H/16, W/16)), built elementwise on the device from the
+            # feature map's shape (no per-call CPU table + copy; traces with dynamic H/W for export)
+            pe = sine_position_encoding(256, fmap1_dw16.shape[2], fmap1_dw16.shape[3], fmap1_dw16.device)
             # 'n c h w -> n (h w) c'
-            x_tmp = pos_encoding_fn_small(fmap1_dw16)
+            x_tmp = fmap1_dw16 + pe
             fmap1_dw16 = x_tmp.permute(0, 2, 3, 1).reshape(x_tmp.shape[0], x_tmp.shape[2] * x_tmp.shape[3], x_tmp.shape[1])
             # 'n c h w -> n (h w) c'
-            x_tmp = pos_encoding_fn_small(fmap2_dw16)
+            x_tmp = fmap2_dw16 + pe
             fmap2_dw16 = x_tmp.permute(0, 2, 3, 1).reshape(x_tmp.shape[0], x_tmp.shape[2] * x_tmp.shape[3], x_tmp.shape[1])
 
+            h16 = x_tmp.shape[2]
             fmap1_dw16, fmap2_dw16 = self.self_att_fn(fmap1_dw16, fmap2_dw16)
             fmap1_dw16, fmap2_dw16 = [
-                x.reshape(x.shape[0], image1.shape[2] // 16, -1, x.shape[2]).permute(0, 3, 1, 2)
+                x.reshape(x.shape[0], h16, -1, x.shape[2]).permute(0, 3, 1, 2)
                 for x in [fmap1_dw16, fmap2_dw16]
             ]
 
