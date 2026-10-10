@@ -81,6 +81,30 @@ class CREStereo(nn.Module):
         self.range_16 = 1
         self.range_8 = 1
 
+    @torch.no_grad()
+    def prepare_inference(self, half=None):
+        """Inference setup: merged / split GRU weights with a per-stage context precompute (update_block), and with
+        mixed precision the conv weights stored in fp16 once (autocast would re-cast them in every iteration, since its
+        cast cache is cleared whenever an autocast region is left; same rounding)."""
+        self.eval()
+        if half is not None:
+            self.mixed_precision = half
+        dtype = torch.float16 if self.mixed_precision else torch.float32
+        for mod in (self.fnet, self.update_block, self.conv_offset_8, self.conv_offset_16):
+            for m in mod.modules():
+                if isinstance(m, nn.Conv2d):
+                    m.to(dtype=dtype)
+        self.update_block.prepare_inference()
+        return self
+
+    def _ctx(self, inp):
+        """GRU input context: precomputed per stage when prepared (inference), else the raw features."""
+        return (
+            self.update_block.context(inp)
+            if getattr(self.update_block, "fused", False) and not self.training
+            else inp
+        )
+
     def freeze_bn(self):
         for m in self.modules():
             if isinstance(m, nn.BatchNorm2d):
@@ -110,6 +134,8 @@ class CREStereo(nn.Module):
     def forward(self, image1, image2, flow_init=None, iters=10, upsample=True, test_mode=False):
         """ Estimate optical flow between pair of frames """
 
+        if not image1.is_cuda and next(self.fnet.parameters()).dtype == torch.float16:
+            raise ValueError("prepared fp16 inference requires CUDA; use prepare_inference(half=False) on CPU")
         image1 = 2 * (image1 / 255.0) - 1.0
         image2 = 2 * (image2 / 255.0) - 1.0
 
@@ -199,6 +225,8 @@ class CREStereo(nn.Module):
 
             # Recurrent Update Module
             # RUM: 1/16
+            with autocast(enabled=self.mixed_precision):
+                inp_dw16 = self._ctx(inp_dw16)
             for itr in range(iters // 2):
                 if itr % 2 == 0:
                     small_patch = False
@@ -241,6 +269,8 @@ class CREStereo(nn.Module):
             )
 
             # RUM: 1/8
+            with autocast(enabled=self.mixed_precision):
+                inp_dw8 = self._ctx(inp_dw8)
             for itr in range(iters // 2):
                 if itr % 2 == 0:
                     small_patch = False
@@ -279,6 +309,8 @@ class CREStereo(nn.Module):
             )
 
         # RUM: 1/4
+        with autocast(enabled=self.mixed_precision):
+            inp = self._ctx(inp)
         for itr in range(iters):
             if itr % 2 == 0:
                 small_patch = False

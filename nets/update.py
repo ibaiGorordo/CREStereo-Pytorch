@@ -61,7 +61,9 @@ class BasicMotionEncoder(nn.Module):
 
         cor_flo = torch.cat([cor, flo], dim=1)
         out = F.relu(self.conv(cor_flo))
-        return torch.cat([out, flow], dim=1)
+        # under autocast `out` is fp16 and flow fp32: the cat would promote every GRU input to fp32 only for the next
+        # conv to round it back; rounding flow here gives the same conv inputs
+        return torch.cat([out, flow.to(out.dtype)], dim=1)
 
 
 class BasicUpdateBlock(nn.Module):
@@ -77,13 +79,80 @@ class BasicUpdateBlock(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(256, mask_size**2 *9, 1, padding=0))
 
+    @torch.no_grad()
+    def prepare_inference(self):
+        """Inference: merged z|r convs, and the GRU conv weights split by input part so that the constant context part
+        (inp, the same in every iteration of a stage) is convolved once per stage (see context()). GRU conv input
+        channels: [h (hidden) | inp (hidden) | motion features (128)]. conv(cat[a, b], W) = conv(a, W_a) + conv(b, W_b)
+        (zero padding is linear), so the result is the same up to rounding."""
+        g = self.gru
+        hd = g.convz1.weight.shape[0]
+        for d in (1, 2):
+            wz, wr, wq = (getattr(g, f"conv{n}{d}").weight for n in "zrq")
+            bz, br, bq = (getattr(g, f"conv{n}{d}").bias for n in "zrq")
+            wzr = torch.cat([wz, wr], 0)
+            for name, t in (
+                (f"zr_h{d}", torch.cat([wzr[:, :hd], wzr[:, 2 * hd :]], 1)),
+                (f"zr_i{d}", wzr[:, hd : 2 * hd]),
+                (f"zr_b{d}", torch.cat([bz, br])),
+                (f"q_h{d}", torch.cat([wq[:, :hd], wq[:, 2 * hd :]], 1)),
+                (f"q_i{d}", wq[:, hd : 2 * hd]),
+                (f"q_b{d}", bq),
+            ):
+                self.register_buffer("_" + name, t.contiguous(), persistent=False)
+        self.fused = True
+        self._prepared_version = self._weight_version()
+        return self
+
+    def _weight_version(self):
+        params = tuple(self.gru.parameters())
+        if any(p.is_inference() for p in params):
+            return None
+        return tuple((id(p), p._version, p.device, p.dtype) for p in params)
+
+    def context(self, inp):
+        """per-stage constant part of the four GRU convs (needs prepare_inference)."""
+        if not (
+            torch.jit.is_tracing() or torch.onnx.is_in_onnx_export() or torch.compiler.is_compiling()
+        ):
+            version = self._weight_version()
+            if version is None:
+                return inp
+            if version != self._prepared_version:
+                self.prepare_inference()
+        return [
+            (
+                F.conv2d(inp, self._zr_i1, self._zr_b1, padding=(0, 2)),
+                F.conv2d(inp, self._q_i1, self._q_b1, padding=(0, 2)),
+            ),
+            (
+                F.conv2d(inp, self._zr_i2, self._zr_b2, padding=(2, 0)),
+                F.conv2d(inp, self._q_i2, self._q_b2, padding=(2, 0)),
+            ),
+        ]
+
+    def _gru_fused(self, h, ctx, mo):
+        hd = h.shape[1]
+        for d, pad in ((1, (0, 2)), (2, (2, 0))):
+            czr, cq = ctx[d - 1]
+            zr = torch.sigmoid(
+                F.conv2d(torch.cat([h, mo], 1), getattr(self, f"_zr_h{d}"), None, padding=pad) + czr
+            )
+            z, r = zr[:, :hd], zr[:, hd:]
+            q = torch.tanh(
+                F.conv2d(torch.cat([r * h, mo], 1), getattr(self, f"_q_h{d}"), None, padding=pad) + cq
+            )
+            h = (1 - z) * h + z * q
+        return h
+
     def forward(self, net, inp, corr, flow, upsample=True, compute_mask=True):
         # print(inp.shape, corr.shape, flow.shape)
         motion_features = self.encoder(flow, corr)
-        # print(motion_features.shape, inp.shape)
-        inp = torch.cat((inp, motion_features), dim=1)
-
-        net = self.gru(net, inp)
+        if isinstance(inp, (list, tuple)):  # precomputed context(inp) (prepare_inference)
+            net = self._gru_fused(net, inp, motion_features)
+        else:
+            inp = torch.cat((inp, motion_features), dim=1)
+            net = self.gru(net, inp)
         delta_flow = self.flow_head(net)
         if not compute_mask:
             return net, None, delta_flow
