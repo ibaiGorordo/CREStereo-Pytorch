@@ -99,7 +99,7 @@ class BasicUpdateBlock(nn.Module):
                 (f"q_i{d}", wq[:, hd : 2 * hd]),
                 (f"q_b{d}", bq),
             ):
-                self.register_buffer("_" + name, t.contiguous(), persistent=False)
+                self.register_buffer("_" + name, t.detach().clone().contiguous(), persistent=False)
         self.fused = True
         self._prepared_version = self._weight_version()
         return self
