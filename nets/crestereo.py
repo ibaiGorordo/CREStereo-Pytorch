@@ -76,10 +76,7 @@ class CREStereo(nn.Module):
 
     def zero_init(self, fmap):
         N, C, H, W = fmap.shape
-        _x = torch.zeros([N, 1, H, W], dtype=torch.float32)
-        _y = torch.zeros([N, 1, H, W], dtype=torch.float32)
-        zero_flow = torch.cat((_x, _y), dim=1).to(fmap.device)
-        return zero_flow
+        return torch.zeros([N, 2, H, W], dtype=torch.float32, device=fmap.device)  # on the device: no host copy / sync
 
     def forward(self, image1, image2, flow_init=None, iters=10, upsample=True, test_mode=False):
         """ Estimate optical flow between pair of frames """
@@ -179,13 +176,20 @@ class CREStereo(nn.Module):
                     flow_dw16, offset_dw16, small_patch=small_patch
                     )
 
+                # test mode: only the last iteration's upsampled flow is used (upsampling mask, convex upsampling
+                # and the full-res interpolation of the other iterations are skipped; same output)
+                last = not self.test_mode or itr == iters // 2 - 1
                 with autocast(enabled=self.mixed_precision):
                     net_dw16, up_mask, delta_flow = self.update_block(
-                        net_dw16, inp_dw16, out_corrs, flow_dw16
+                        net_dw16, inp_dw16, out_corrs, flow_dw16, compute_mask=last
                     )
 
                 flow_dw16 = flow_dw16 + delta_flow
+                if not last:
+                    continue
                 flow = self.convex_upsample(flow_dw16, up_mask, rate=4)
+                if self.test_mode:
+                    continue
                 flow_up = -4 * F.interpolate(
                     flow,
                     size=(4 * flow.shape[2], 4 * flow.shape[3]),
@@ -212,13 +216,18 @@ class CREStereo(nn.Module):
                 flow_dw8 = flow_dw8.detach()
                 out_corrs = corr_fn_dw8(flow_dw8, offset_dw8, small_patch=small_patch)
 
+                last = not self.test_mode or itr == iters // 2 - 1
                 with autocast(enabled=self.mixed_precision):
                     net_dw8, up_mask, delta_flow = self.update_block(
-                        net_dw8, inp_dw8, out_corrs, flow_dw8
+                        net_dw8, inp_dw8, out_corrs, flow_dw8, compute_mask=last
                     )
 
                 flow_dw8 = flow_dw8 + delta_flow
+                if not last:
+                    continue
                 flow = self.convex_upsample(flow_dw8, up_mask, rate=4)
+                if self.test_mode:
+                    continue
                 flow_up = -2 * F.interpolate(
                     flow,
                     size=(2 * flow.shape[2], 2 * flow.shape[3]),
@@ -245,10 +254,13 @@ class CREStereo(nn.Module):
             flow = flow.detach()
             out_corrs = corr_fn(flow, None, small_patch=small_patch, iter_mode=True)
 
+            last = not self.test_mode or itr == iters - 1
             with autocast(enabled=self.mixed_precision):
-                net, up_mask, delta_flow = self.update_block(net, inp, out_corrs, flow)
+                net, up_mask, delta_flow = self.update_block(net, inp, out_corrs, flow, compute_mask=last)
 
             flow = flow + delta_flow
+            if not last:
+                continue
             flow_up = -self.convex_upsample(flow, up_mask, rate=4)
             predictions.append(flow_up)
 
