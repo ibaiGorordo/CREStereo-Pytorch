@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,7 +7,7 @@ from .update import BasicUpdateBlock
 from .extractor import BasicEncoder
 from .corr import AGCL
 
-from .attention import PositionEncodingSine, LocalFeatureTransformer
+from .attention import LocalFeatureTransformer
 
 try:
     autocast = torch.cuda.amp.autocast
@@ -19,6 +20,31 @@ except:
             pass
         def __exit__(self, *args):
             pass
+
+def sine_position_encoding(d_model, h, w, device):
+    """PositionEncodingSine(d_model, max_shape=(h, w)).pe (temp_bug_fix=False, the trained variant) without the table:
+    channel 4k+j = sin(x d_k), cos(x d_k), sin(y d_k), cos(y d_k); x, y 1-based; d_k = exp(2k * (-log(1e4) / d_model // 2))."""
+    div = torch.exp(
+        torch.arange(0, d_model // 2, 2, device=device).float()
+        * (-math.log(10000.0) / d_model // 2)
+    )
+    x = (
+        torch.arange(1, w + 1, device=device).float()[None, None, :] * div[:, None, None]
+    )  # [C/4, 1, w]
+    y = (
+        torch.arange(1, h + 1, device=device).float()[None, :, None] * div[:, None, None]
+    )  # [C/4, h, 1]
+    pe = torch.stack(
+        [
+            torch.sin(x).expand(-1, h, -1),
+            torch.cos(x).expand(-1, h, -1),
+            torch.sin(y).expand(-1, -1, w),
+            torch.cos(y).expand(-1, -1, w),
+        ],
+        1,
+    )  # [C/4, 4, h, w]
+    return pe.reshape(1, d_model, h, w)
+
 
 #Ref: https://github.com/princeton-vl/RAFT/blob/master/core/raft.py
 class CREStereo(nn.Module):
@@ -55,6 +81,30 @@ class CREStereo(nn.Module):
         self.range_16 = 1
         self.range_8 = 1
 
+    @torch.no_grad()
+    def prepare_inference(self, half=None):
+        """Inference setup: merged / split GRU weights with a per-stage context precompute (update_block), and with
+        mixed precision the conv weights stored in fp16 once (autocast would re-cast them in every iteration, since its
+        cast cache is cleared whenever an autocast region is left; same rounding)."""
+        self.eval()
+        if half is not None:
+            self.mixed_precision = half
+        dtype = torch.float16 if self.mixed_precision else torch.float32
+        for mod in (self.fnet, self.update_block, self.conv_offset_8, self.conv_offset_16):
+            for m in mod.modules():
+                if isinstance(m, nn.Conv2d):
+                    m.to(dtype=dtype)
+        self.update_block.prepare_inference()
+        return self
+
+    def _ctx(self, inp):
+        """GRU input context: precomputed per stage when prepared (inference), else the raw features."""
+        return (
+            self.update_block.context(inp)
+            if getattr(self.update_block, "fused", False) and not self.training
+            else inp
+        )
+
     def freeze_bn(self):
         for m in self.modules():
             if isinstance(m, nn.BatchNorm2d):
@@ -67,7 +117,10 @@ class CREStereo(nn.Module):
         mask = mask.view(N, 1, 9, rate, rate, H, W)
         mask = torch.softmax(mask, dim=2)
 
-        up_flow = F.unfold(rate * flow, [3,3], padding=1)
+        # 3x3 neighbourhoods as 9 shifted slices of the zero-padded flow (= F.unfold(.., [3,3], padding=1), same
+        # order; Im2Col has no ONNX / TensorRT counterpart)
+        fp = F.pad(rate * flow, [1, 1, 1, 1])
+        up_flow = torch.stack([fp[:, :, i:i + H, j:j + W] for i in range(3) for j in range(3)], dim=2)
         up_flow = up_flow.view(N, 2, 9, 1, 1, H, W)
 
         up_flow = torch.sum(mask * up_flow, dim=2)
@@ -76,14 +129,13 @@ class CREStereo(nn.Module):
 
     def zero_init(self, fmap):
         N, C, H, W = fmap.shape
-        _x = torch.zeros([N, 1, H, W], dtype=torch.float32)
-        _y = torch.zeros([N, 1, H, W], dtype=torch.float32)
-        zero_flow = torch.cat((_x, _y), dim=1).to(fmap.device)
-        return zero_flow
+        return torch.zeros([N, 2, H, W], dtype=torch.float32, device=fmap.device)  # on the device: no host copy / sync
 
     def forward(self, image1, image2, flow_init=None, iters=10, upsample=True, test_mode=False):
         """ Estimate optical flow between pair of frames """
 
+        if not image1.is_cuda and next(self.fnet.parameters()).dtype == torch.float16:
+            raise ValueError("prepared fp16 inference requires CUDA; use prepare_inference(half=False) on CPU")
         image1 = 2 * (image1 / 255.0) - 1.0
         image2 = 2 * (image2 / 255.0) - 1.0
 
@@ -95,7 +147,11 @@ class CREStereo(nn.Module):
 
         # run the feature network
         with autocast(enabled=self.mixed_precision):
-            fmap1, fmap2 = self.fnet([image1, image2])        
+            if self.training:
+                fmap1, fmap2 = self.fnet([image1, image2])
+            else:
+                # one image at a time: instance norm is per sample (same result), halves the full-res activation peak
+                fmap1, fmap2 = self.fnet(image1), self.fnet(image2)
         
         fmap1 = fmap1.float()
         fmap2 = fmap2.float()
@@ -130,19 +186,20 @@ class CREStereo(nn.Module):
             inp_dw16 = F.avg_pool2d(inp, 4, stride=4)
 
             # positional encoding and self-attention
-            pos_encoding_fn_small = PositionEncodingSine(
-                d_model=256, max_shape=(image1.shape[2] // 16, image1.shape[3] // 16)
-            )
+            # same values as PositionEncodingSine(256, max_shape=(H/16, W/16)), built elementwise on the device from the
+            # feature map's shape (no per-call CPU table + copy; traces with dynamic H/W for export)
+            pe = sine_position_encoding(256, fmap1_dw16.shape[2], fmap1_dw16.shape[3], fmap1_dw16.device)
             # 'n c h w -> n (h w) c'
-            x_tmp = pos_encoding_fn_small(fmap1_dw16)
+            x_tmp = fmap1_dw16 + pe
             fmap1_dw16 = x_tmp.permute(0, 2, 3, 1).reshape(x_tmp.shape[0], x_tmp.shape[2] * x_tmp.shape[3], x_tmp.shape[1])
             # 'n c h w -> n (h w) c'
-            x_tmp = pos_encoding_fn_small(fmap2_dw16)
+            x_tmp = fmap2_dw16 + pe
             fmap2_dw16 = x_tmp.permute(0, 2, 3, 1).reshape(x_tmp.shape[0], x_tmp.shape[2] * x_tmp.shape[3], x_tmp.shape[1])
 
+            h16 = x_tmp.shape[2]
             fmap1_dw16, fmap2_dw16 = self.self_att_fn(fmap1_dw16, fmap2_dw16)
             fmap1_dw16, fmap2_dw16 = [
-                x.reshape(x.shape[0], image1.shape[2] // 16, -1, x.shape[2]).permute(0, 3, 1, 2)
+                x.reshape(x.shape[0], h16, -1, x.shape[2]).permute(0, 3, 1, 2)
                 for x in [fmap1_dw16, fmap2_dw16]
             ]
 
@@ -168,6 +225,8 @@ class CREStereo(nn.Module):
 
             # Recurrent Update Module
             # RUM: 1/16
+            with autocast(enabled=self.mixed_precision):
+                inp_dw16 = self._ctx(inp_dw16)
             for itr in range(iters // 2):
                 if itr % 2 == 0:
                     small_patch = False
@@ -179,13 +238,20 @@ class CREStereo(nn.Module):
                     flow_dw16, offset_dw16, small_patch=small_patch
                     )
 
+                # test mode: only the last iteration's upsampled flow is used (upsampling mask, convex upsampling
+                # and the full-res interpolation of the other iterations are skipped; same output)
+                last = not self.test_mode or itr == iters // 2 - 1
                 with autocast(enabled=self.mixed_precision):
                     net_dw16, up_mask, delta_flow = self.update_block(
-                        net_dw16, inp_dw16, out_corrs, flow_dw16
+                        net_dw16, inp_dw16, out_corrs, flow_dw16, compute_mask=last
                     )
 
                 flow_dw16 = flow_dw16 + delta_flow
+                if not last:
+                    continue
                 flow = self.convex_upsample(flow_dw16, up_mask, rate=4)
+                if self.test_mode:
+                    continue
                 flow_up = -4 * F.interpolate(
                     flow,
                     size=(4 * flow.shape[2], 4 * flow.shape[3]),
@@ -203,6 +269,8 @@ class CREStereo(nn.Module):
             )
 
             # RUM: 1/8
+            with autocast(enabled=self.mixed_precision):
+                inp_dw8 = self._ctx(inp_dw8)
             for itr in range(iters // 2):
                 if itr % 2 == 0:
                     small_patch = False
@@ -212,13 +280,18 @@ class CREStereo(nn.Module):
                 flow_dw8 = flow_dw8.detach()
                 out_corrs = corr_fn_dw8(flow_dw8, offset_dw8, small_patch=small_patch)
 
+                last = not self.test_mode or itr == iters // 2 - 1
                 with autocast(enabled=self.mixed_precision):
                     net_dw8, up_mask, delta_flow = self.update_block(
-                        net_dw8, inp_dw8, out_corrs, flow_dw8
+                        net_dw8, inp_dw8, out_corrs, flow_dw8, compute_mask=last
                     )
 
                 flow_dw8 = flow_dw8 + delta_flow
+                if not last:
+                    continue
                 flow = self.convex_upsample(flow_dw8, up_mask, rate=4)
+                if self.test_mode:
+                    continue
                 flow_up = -2 * F.interpolate(
                     flow,
                     size=(2 * flow.shape[2], 2 * flow.shape[3]),
@@ -236,6 +309,8 @@ class CREStereo(nn.Module):
             )
 
         # RUM: 1/4
+        with autocast(enabled=self.mixed_precision):
+            inp = self._ctx(inp)
         for itr in range(iters):
             if itr % 2 == 0:
                 small_patch = False
@@ -245,10 +320,13 @@ class CREStereo(nn.Module):
             flow = flow.detach()
             out_corrs = corr_fn(flow, None, small_patch=small_patch, iter_mode=True)
 
+            last = not self.test_mode or itr == iters - 1
             with autocast(enabled=self.mixed_precision):
-                net, up_mask, delta_flow = self.update_block(net, inp, out_corrs, flow)
+                net, up_mask, delta_flow = self.update_block(net, inp, out_corrs, flow, compute_mask=last)
 
             flow = flow + delta_flow
+            if not last:
+                continue
             flow_up = -self.convex_upsample(flow, up_mask, rate=4)
             predictions.append(flow_up)
 
